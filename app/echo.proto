@@ -1,0 +1,12 @@
+syntax = "proto3";
+package echo;
+service EchoService {
+rpc SayHello (EchoRequest) returns (EchoReply) {}
+}
+message EchoRequest {
+string name = 1;
+}
+message EchoReply {
+string message = 1;
+string instance = 2;
+}

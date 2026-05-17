@@ -1,0 +1,1497 @@
+= Hands-on Lab: Load Balancers, WebSocket, gRPC, and Metrics
+:toc:
+:toclevels: 3
+:source-highlighter: rouge
+
+== Learning objectives
+
+By the end of this lab, participants will be able to:
+
+[arabic]
+. Understand the difference between Layer 4 and Layer 7 load balancing.
+. Observe how traffic is distributed across backend services.
+. Compare common load balancing algorithms.
+. Understand how load balancing behaves differently for HTTP, WebSocket,
+and gRPC traffic.
+. See how health checks influence routing decisions.
+. Understand sticky sessions and long-lived connections.
+. Use Prometheus and Grafana to observe backend traffic distribution.
+. Discuss load balancing trade-offs from a software architect’s
+perspective.
+
+== 1. Lab Overview
+
+This lab runs locally using Docker containers.
+
+Participants will deploy:
+
+* 3 backend application containers
+* 1 NGINX Layer 7 load balancer
+* 1 HAProxy Layer 4 load balancer
+* 1 Prometheus container
+* 1 Grafana container
+* 1 toolbox/test-runner container with HTTP, WebSocket, gRPC, JSON, and
+network diagnostic tools
+
+The lab demonstrates four major scenarios:
+
+[arabic]
+. HTTP request load balancing
+. WebSocket load balancing
+. gRPC load balancing
+. Metrics-based observability with Prometheus and Grafana
+
+High-level architecture:
+
+....
+                         Participants
+                             |
+        ------------------------------------------------
+        |                       |                      |
+   HTTP via NGINX       WebSocket via NGINX      gRPC via NGINX
+        |                       |                      |
+        ------------------------------------------------
+                             |
+              ---------------------------------
+              |               |               |
+          app1:8080       app2:8080       app3:8080
+              |               |               |
+              -------- Prometheus metrics ------
+                             |
+                         Prometheus
+                             |
+                           Grafana
+....
+
+A Layer 4 HAProxy setup is also included so participants can compare
+TCP-level balancing with HTTP-aware balancing.
+
+== 2. Architect’s Framing
+
+Before starting the technical work, explain the architectural goal.
+
+A load balancer is not only a traffic distributor. It is an
+architectural control point for:
+
+* scalability,
+* availability,
+* failure isolation,
+* traffic routing,
+* protocol handling,
+* TLS termination,
+* observability,
+* and sometimes security policy enforcement.
+
+Different protocols create different load balancing concerns.
+
+[width="100%",cols="34%,33%,33%",options="header",]
+|===
+|Traffic type |Connection behavior |Load balancing concern
+|HTTP |Usually request/response |Distribution per request
+
+|WebSocket |Long-lived connection |Distribution per connection
+
+|gRPC |HTTP/2, often long-lived channels |Multiplexed calls over
+persistent connections
+
+|Raw TCP |Transport-level stream |No application-level visibility
+|===
+
+The key teaching point is this:
+
+____
+The load balancer must match the communication pattern, not just the
+port number.
+____
+
+== 3. Prerequisites
+
+Participants need:
+
+* Docker Desktop or Docker Engine
+* Docker Compose
+* A web browser for Prometheus and Grafana
+* The lab includes a dedicated toolbox container with curl, grpcurl,
+websocat, jq, and basic network diagnostics.
+* Local curl, grpcurl, websocat, and Python are optional, not required
+for the standard lab path.
+
+Verify Docker:
+
+....
+docker --version
+docker compose version
+....
+
+== 4. Project Structure
+
+Create this structure:
+
+....
+load-balancer-lab/
+├── docker-compose.yml
+├── app/
+│   ├── Dockerfile
+│   ├── requirements.txt
+│   ├── server.py
+│   ├── echo.proto
+│   ├── echo_pb2.py
+│   └── echo_pb2_grpc.py
+├── nginx/
+│   └── nginx.conf
+├── haproxy/
+│   └── haproxy.cfg
+├── prometheus/
+│   └── prometheus.yml
+├── grafana/
+│   └── provisioning/
+│       ├── datasources/
+│       │   └── datasource.yml
+│       └── dashboards/
+│           └── dashboard.yml
+└── tools/
+    └── Dockerfile
+....
+
+For simplicity, the generated gRPC Python files are included in the lab.
+In a more advanced version, participants can generate them from the
+`+.proto+` file.
+
+== 5. Backend Application
+
+The backend application exposes four interfaces:
+
+[width="100%",cols="50%,50%",options="header",]
+|===
+|Endpoint |Purpose
+|`+GET /+` |Simple HTTP response
+|`+GET /slow+` |Simulates a slow HTTP request
+|`+GET /metrics+` |Prometheus metrics
+|`+GET /ws+` |WebSocket echo endpoint
+|gRPC `+EchoService/SayHello+` |gRPC request/response example
+|===
+
+Each backend returns its own instance name, such as `+app1+`, `+app2+`,
+or `+app3+`.
+
+This allows participants to observe which backend handled each request.
+
+=== 5.1 app/requirements.txt
+
+....
+flask==3.0.3
+prometheus-client==0.20.0
+gevent==24.2.1
+gevent-websocket==0.10.1
+grpcio==1.66.1
+grpcio-tools==1.66.1
+....
+
+=== 5.2 app/echo.proto
+
+....
+syntax = "proto3";
+
+package echo;
+
+service EchoService {
+  rpc SayHello (EchoRequest) returns (EchoReply) {}
+}
+
+message EchoRequest {
+  string name = 1;
+}
+
+message EchoReply {
+  string message = 1;
+  string instance = 2;
+}
+....
+
+=== 5.3 Generate gRPC Python files
+
+From the `+app+` directory, run:
+
+....
+python -m grpc_tools.protoc -I. --python_out=. --grpc_python_out=. echo.proto
+....
+
+This generates:
+
+....
+echo_pb2.py
+echo_pb2_grpc.py
+....
+
+For a course setup, these files can be generated once and committed into
+the lab folder so participants do not need to perform this step
+manually.
+
+=== 5.4 app/server.py
+
+....
+import os
+import time
+import threading
+from concurrent import futures
+
+from flask import Flask, Response, request
+from gevent.pywsgi import WSGIServer
+from geventwebsocket.handler import WebSocketHandler
+from prometheus_client import Counter, Histogram, generate_latest, CONTENT_TYPE_LATEST
+
+import grpc
+import echo_pb2
+import echo_pb2_grpc
+
+INSTANCE = os.environ.get("INSTANCE_NAME", "unknown")
+HTTP_PORT = int(os.environ.get("HTTP_PORT", "8080"))
+GRPC_PORT = int(os.environ.get("GRPC_PORT", "50051"))
+
+app = Flask(__name__)
+
+http_requests = Counter(
+    "app_http_requests_total",
+    "Total HTTP requests handled by backend instance",
+    ["instance", "path"]
+)
+
+ws_messages = Counter(
+    "app_websocket_messages_total",
+    "Total WebSocket messages handled by backend instance",
+    ["instance"]
+)
+
+grpc_requests = Counter(
+    "app_grpc_requests_total",
+    "Total gRPC requests handled by backend instance",
+    ["instance", "method"]
+)
+
+request_latency = Histogram(
+    "app_http_request_duration_seconds",
+    "HTTP request duration in seconds",
+    ["instance", "path"]
+)
+
+
+@app.route("/")
+def index():
+    with request_latency.labels(INSTANCE, "/").time():
+        http_requests.labels(INSTANCE, "/").inc()
+        return f"HTTP response from {INSTANCE}\n"
+
+
+@app.route("/slow")
+def slow():
+    delay = float(request.args.get("delay", "2"))
+    with request_latency.labels(INSTANCE, "/slow").time():
+        http_requests.labels(INSTANCE, "/slow").inc()
+        time.sleep(delay)
+        return f"Slow HTTP response from {INSTANCE} after {delay} seconds\n"
+
+
+@app.route("/health")
+def health():
+    return "OK\n"
+
+
+@app.route("/metrics")
+def metrics():
+    return Response(generate_latest(), mimetype=CONTENT_TYPE_LATEST)
+
+
+@app.route("/ws")
+def websocket_echo():
+    ws = request.environ.get("wsgi.websocket")
+    if not ws:
+        return "Expected WebSocket request\n", 400
+
+    ws.send(f"Connected to {INSTANCE}")
+
+    while True:
+        message = ws.receive()
+        if message is None:
+            break
+        ws_messages.labels(INSTANCE).inc()
+        ws.send(f"{INSTANCE} received: {message}")
+
+    return ""
+
+
+class EchoService(echo_pb2_grpc.EchoServiceServicer):
+    def SayHello(self, request, context):
+        grpc_requests.labels(INSTANCE, "SayHello").inc()
+        return echo_pb2.EchoReply(
+            message=f"Hello {request.name} from {INSTANCE}",
+            instance=INSTANCE
+        )
+
+
+def start_grpc_server():
+    server = grpc.server(futures.ThreadPoolExecutor(max_workers=10))
+    echo_pb2_grpc.add_EchoServiceServicer_to_server(EchoService(), server)
+    server.add_insecure_port(f"[::]:{GRPC_PORT}")
+    server.start()
+    print(f"gRPC server for {INSTANCE} listening on {GRPC_PORT}")
+    server.wait_for_termination()
+
+
+if __name__ == "__main__":
+    threading.Thread(target=start_grpc_server, daemon=True).start()
+    print(f"HTTP/WebSocket server for {INSTANCE} listening on {HTTP_PORT}")
+    http_server = WSGIServer(("0.0.0.0", HTTP_PORT), app, handler_class=WebSocketHandler)
+    http_server.serve_forever()
+....
+
+=== 5.5 app/Dockerfile
+
+....
+FROM python:3.11-slim
+
+WORKDIR /app
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY . .
+
+CMD ["python", "server.py"]
+....
+
+== 6. NGINX Layer 7 Load Balancer
+
+NGINX will expose:
+
+[width="100%",cols="50%,50%",options="header",]
+|===
+|Local port |Purpose
+|`+8080+` |HTTP and WebSocket traffic
+|`+8081+` |gRPC traffic
+|===
+
+=== 6.1 nginx/nginx.conf
+
+....
+events {}
+
+http {
+    upstream http_backend {
+        server app1:8080;
+        server app2:8080;
+        server app3:8080;
+    }
+
+    upstream grpc_backend {
+        server app1:50051;
+        server app2:50051;
+        server app3:50051;
+    }
+
+    server {
+        listen 80;
+
+        location / {
+            proxy_pass http://http_backend;
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        }
+
+        location /ws {
+            proxy_pass http://http_backend;
+            proxy_http_version 1.1;
+            proxy_set_header Upgrade $http_upgrade;
+            proxy_set_header Connection "Upgrade";
+            proxy_set_header Host $host;
+            proxy_read_timeout 3600s;
+        }
+    }
+
+    server {
+        listen 81 http2;
+
+        location / {
+            grpc_pass grpc://grpc_backend;
+        }
+    }
+}
+....
+
+== 7. HAProxy Layer 4 Load Balancer
+
+HAProxy will expose raw TCP balancing.
+
+[width="100%",cols="50%,50%",options="header",]
+|===
+|Local port |Purpose
+|`+9000+` |TCP load balancing to HTTP backend port 8080
+|`+9001+` |TCP load balancing to gRPC backend port 50051
+|===
+
+This demonstrates that a Layer 4 load balancer can forward traffic
+without understanding HTTP, WebSocket, or gRPC semantics.
+
+=== 7.1 haproxy/haproxy.cfg
+
+....
+global
+    maxconn 2000
+
+defaults
+    mode tcp
+    timeout connect 5s
+    timeout client 30s
+    timeout server 30s
+
+frontend tcp_http_front
+    bind *:9000
+    default_backend tcp_http_back
+
+backend tcp_http_back
+    balance roundrobin
+    server app1 app1:8080 check
+    server app2 app2:8080 check
+    server app3 app3:8080 check
+
+frontend tcp_grpc_front
+    bind *:9001
+    default_backend tcp_grpc_back
+
+backend tcp_grpc_back
+    balance roundrobin
+    server app1 app1:50051 check
+    server app2 app2:50051 check
+    server app3 app3:50051 check
+....
+
+== 8. Prometheus Configuration
+
+Prometheus scrapes metrics from each backend app.
+
+=== prometheus/prometheus.yml
+
+....
+global:
+  scrape_interval: 5s
+
+scrape_configs:
+  - job_name: "backend-apps"
+    static_configs:
+      - targets:
+          - "app1:8080"
+          - "app2:8080"
+          - "app3:8080"
+....
+
+== 9. Grafana Provisioning
+
+Grafana will start with Prometheus already configured as a data source.
+
+=== grafana/provisioning/datasources/datasource.yml
+
+....
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+....
+
+=== grafana/provisioning/dashboards/dashboard.yml
+
+....
+apiVersion: 1
+
+providers:
+  - name: Load Balancer Lab
+    orgId: 1
+    folder: Load Balancer Lab
+    type: file
+    disableDeletion: false
+    editable: true
+    options:
+      path: /var/lib/grafana/dashboards
+....
+
+For simplicity, participants can create dashboard panels manually during
+the lab.
+
+Suggested PromQL queries are included later.
+
+== 10. Docker Compose Setup
+
+The lab includes a persistent toolbox container. It provides a
+reproducible client environment for HTTP, WebSocket, and gRPC
+experiments, so participants do not need to install protocol-specific
+command-line tools locally.
+
+=== 10.1 tools/Dockerfile
+
+....
+FROM debian:bookworm-slim
+
+ARG GRPCURL_VERSION=1.9.3
+ARG WEBSOCAT_VERSION=1.14.1
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    bash \
+    ca-certificates \
+    curl \
+    jq \
+    tar \
+    netcat-openbsd \
+    iputils-ping \
+    dnsutils \
+    procps \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN set -eux; \
+    ARCH="$(dpkg --print-architecture)"; \
+    case "${ARCH}" in \
+      "amd64") \
+        GRPCURL_ARCH="amd64"; \
+        WEBSOCAT_ARCH="x86_64-unknown-linux-musl"; \
+        ;; \
+      "arm64") \
+        GRPCURL_ARCH="arm64"; \
+        WEBSOCAT_ARCH="aarch64-unknown-linux-musl"; \
+        ;; \
+      *) \
+        echo "Unsupported architecture: ${ARCH}"; \
+        exit 1; \
+        ;; \
+    esac; \
+    curl -fsSL \
+      "https://github.com/fullstorydev/grpcurl/releases/download/v${GRPCURL_VERSION}/grpcurl_${GRPCURL_VERSION}_linux_${GRPCURL_ARCH}.tar.gz" \
+      | tar -xz -C /usr/local/bin grpcurl; \
+    curl -fsSL \
+      "https://github.com/vi/websocat/releases/download/v${WEBSOCAT_VERSION}/websocat.${WEBSOCAT_ARCH}" \
+      -o /usr/local/bin/websocat; \
+    chmod +x /usr/local/bin/grpcurl /usr/local/bin/websocat
+
+WORKDIR /workspace
+
+CMD ["sleep", "infinity"]
+....
+
+=== 10.2 docker-compose.yml
+
+....
+services:
+
+  app1:
+    build: ./app
+    environment:
+      INSTANCE_NAME: app1
+      HTTP_PORT: 8080
+      GRPC_PORT: 50051
+
+  app2:
+    build: ./app
+    environment:
+      INSTANCE_NAME: app2
+      HTTP_PORT: 8080
+      GRPC_PORT: 50051
+
+  app3:
+    build: ./app
+    environment:
+      INSTANCE_NAME: app3
+      HTTP_PORT: 8080
+      GRPC_PORT: 50051
+
+  nginx:
+    image: nginx:1.27
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+    ports:
+      - "8080:80"
+      - "8081:81"
+    depends_on:
+      - app1
+      - app2
+      - app3
+
+  haproxy:
+    image: haproxy:3.0
+    volumes:
+      - ./haproxy/haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    depends_on:
+      - app1
+      - app2
+      - app3
+
+  prometheus:
+    image: prom/prometheus:v2.54.1
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports:
+      - "9090:9090"
+    depends_on:
+      - app1
+      - app2
+      - app3
+
+  grafana:
+    image: grafana/grafana:11.1.4
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+    ports:
+      - "3000:3000"
+    depends_on:
+      - prometheus
+
+  toolbox:
+    build:
+      context: ./tools
+    container_name: load-balancer-lab-toolbox
+    stdin_open: true
+    tty: true
+    command: ["sleep", "infinity"]
+    volumes:
+      - ./app:/workspace/app:ro
+    depends_on:
+      - nginx
+      - haproxy
+      - prometheus
+....
+
+== 11. Start the Lab
+
+From the project root:
+
+....
+docker compose up --build
+....
+
+Verify containers:
+
+....
+docker compose ps
+....
+
+=== 11.1 Open the Toolbox Container
+
+All CLI-based tests can be executed from the toolbox container. This
+keeps the lab environment reproducible and avoids local installation
+differences.
+
+....
+docker compose exec toolbox bash
+....
+
+Verify the available tools:
+
+....
+curl --version
+grpcurl --version
+websocat --version
+jq --version
+....
+
+When commands run inside the toolbox, use Docker Compose service names
+rather than localhost ports:
+
+[width="100%",cols="50%,50%",options="header",]
+|===
+|Target |Address from toolbox
+|NGINX HTTP/WebSocket |http://nginx and ws://nginx/ws
+|NGINX gRPC |nginx:81
+|HAProxy HTTP TCP frontend |http://haproxy:9000
+|HAProxy gRPC TCP frontend |haproxy:9001
+|Prometheus |http://prometheus:9090
+|===
+
+Host-facing browser URLs such as http://localhost:9090 and
+http://localhost:3000 remain unchanged. The toolbox addresses are used
+only for commands executed inside the Compose network.
+
+Architect’s note
+
+The toolbox container isolates the traffic-generation environment from
+the participant workstation. It improves reproducibility, keeps
+protocol-specific tooling close to the lab topology, and reduces setup
+noise during architecture-focused experiments.
+
+Open the tools:
+
+[width="100%",cols="50%,50%",options="header",]
+|===
+|Tool |URL
+|HTTP through NGINX |`+http://localhost:8080+`
+|gRPC through NGINX |`+localhost:8081+`
+|HTTP through HAProxy L4 |`+http://localhost:9000+`
+|Prometheus |`+http://localhost:9090+`
+|Grafana |`+http://localhost:3000+`
+|===
+
+Default Grafana login:
+
+....
+username: admin
+password: admin
+....
+
+Grafana may ask to change the password. For a temporary lab,
+participants can skip this if the UI allows it.
+
+== 12. Experiment 1 — HTTP Round Robin with NGINX
+
+Run:
+
+....
+docker compose exec toolbox bash -lc 'for i in {1..12}; do curl -s http://nginx; done'
+....
+
+Expected result:
+
+....
+HTTP response from app1
+HTTP response from app2
+HTTP response from app3
+HTTP response from app1
+...
+....
+
+=== Discussion
+
+Round robin is simple and useful when:
+
+* backends have similar capacity,
+* requests have similar cost,
+* and services are stateless.
+
+=== Architect’s note
+
+Round robin is easy to understand, but it does not know whether one
+backend is slower or busier than another.
+
+== 13. Experiment 2 — Weighted Round Robin
+
+Modify the NGINX upstream:
+
+....
+upstream http_backend {
+    server app1:8080 weight=5;
+    server app2:8080 weight=2;
+    server app3:8080 weight=1;
+}
+....
+
+Restart NGINX:
+
+....
+docker compose restart nginx
+....
+
+Run:
+
+....
+docker compose exec toolbox bash -lc 'for i in {1..24}; do curl -s http://nginx; done | sort | uniq -c'
+....
+
+Expected result:
+
+`+app1+` should receive more requests than `+app2+`, and `+app2+` more
+than `+app3+`.
+
+=== Discussion
+
+Weighted balancing is useful when backend capacity differs.
+
+=== Short example
+
+A migration is in progress. Two old servers remain in service, but one
+new server has much more CPU and memory. Weighted load balancing can
+shift more traffic to the stronger server.
+
+== 14. Experiment 3 — Least Connections with HAProxy
+
+Modify HAProxy backend:
+
+....
+backend tcp_http_back
+    balance leastconn
+    server app1 app1:8080 check
+    server app2 app2:8080 check
+    server app3 app3:8080 check
+....
+
+Restart HAProxy:
+
+....
+docker compose restart haproxy
+....
+
+Generate slow requests in parallel:
+
+....
+docker compose exec toolbox bash -lc 'for i in {1..12}; do curl -s "http://haproxy:9000/slow?delay=3" & done; wait'
+....
+
+=== Discussion
+
+Least-connections balancing is useful when requests have different
+durations.
+
+=== Architect’s note
+
+For long-running requests, equal request counts do not necessarily mean
+equal load. Least-connections can be more appropriate than round robin.
+
+== 15. Experiment 4 — Sticky Sessions
+
+Modify NGINX upstream:
+
+....
+upstream http_backend {
+    ip_hash;
+    server app1:8080;
+    server app2:8080;
+    server app3:8080;
+}
+....
+
+Restart:
+
+....
+docker compose restart nginx
+....
+
+Run from the same machine:
+
+....
+docker compose exec toolbox bash -lc 'for i in {1..10}; do curl -s http://nginx; done'
+....
+
+Expected result:
+
+Requests from the same client usually go to the same backend.
+
+=== Discussion
+
+Sticky sessions are useful for legacy applications that keep session
+state in local memory.
+
+=== Architectural trade-off
+
+Sticky sessions reduce elasticity. If one backend fails, user sessions
+may be disrupted unless session state is externalized.
+
+A more scalable architecture stores session state outside the
+application instance, for example in Redis or a database.
+
+== 16. Experiment 5 — WebSocket Load Balancing
+
+WebSocket begins as an HTTP request and then upgrades the connection to
+a long-lived bidirectional channel.
+
+This changes the load balancing behavior.
+
+For normal HTTP, a load balancer can distribute every request
+independently.
+
+For WebSocket, the load balancer usually chooses a backend when the
+connection is established. After that, messages stay on the same
+connection and therefore the same backend.
+
+=== 16.1 Test WebSocket from the toolbox container
+
+Run the WebSocket client from the toolbox container:
+
+....
+docker compose exec toolbox websocat ws://nginx/ws
+....
+
+Type:
+
+....
+hello
+....
+
+Expected response:
+
+....
+Connected to app1
+app1 received: hello
+....
+
+Open two or three terminals and connect again:
+
+....
+docker compose exec toolbox websocat ws://nginx/ws
+....
+
+You should see different backend instances across different WebSocket
+connections.
+
+=== Discussion
+
+For WebSocket systems, distribution is usually per connection, not per
+message.
+
+This matters because WebSocket connections can remain open for minutes
+or hours.
+
+=== Short example
+
+A trading dashboard opens one WebSocket connection and receives live
+market data. If 10,000 users connect, the load balancer distributes
+10,000 long-lived connections. It does not rebalance every message.
+
+=== Architect’s note
+
+WebSocket architectures need careful planning for:
+
+* connection count,
+* backend memory usage,
+* idle timeouts,
+* reconnection behavior,
+* sticky routing,
+* and graceful shutdown.
+
+== 17. Experiment 6 — gRPC Load Balancing
+
+gRPC commonly runs over HTTP/2. HTTP/2 allows multiple logical requests
+over the same long-lived connection.
+
+This creates an important load balancing lesson:
+
+____
+If a client opens one persistent HTTP/2 connection, many gRPC calls may
+continue to use the same backend.
+____
+
+This can surprise teams expecting request-by-request distribution.
+
+=== 17.1 Test gRPC from the toolbox container
+
+From the toolbox container, use the mounted proto file at
+/workspace/app:
+
+....
+docker compose exec toolbox grpcurl -plaintext \
+  -import-path /workspace/app \
+  -proto echo.proto \
+  -d '{"name":"Architect"}' \
+  nginx:81 echo.EchoService/SayHello
+....
+
+Expected response:
+
+....
+{
+  "message": "Hello Architect from app1",
+  "instance": "app1"
+}
+....
+
+Run it multiple times:
+
+....
+docker compose exec toolbox bash -lc '
+for i in {1..12}; do
+  grpcurl -plaintext \
+    -import-path /workspace/app \
+    -proto echo.proto \
+    -d "{\"name\":\"Architect\"}" \
+    nginx:81 echo.EchoService/SayHello
+done
+'
+....
+
+Depending on connection behavior, calls may distribute across backends
+or reuse connections.
+
+=== 17.2 Test gRPC through HAProxy Layer 4
+
+....
+docker compose exec toolbox grpcurl -plaintext \
+  -import-path /workspace/app \
+  -proto echo.proto \
+  -d '{"name":"L4"}' \
+  haproxy:9001 echo.EchoService/SayHello
+....
+
+=== Discussion
+
+Layer 4 balancing can forward gRPC because it is TCP traffic, but it
+does not understand gRPC methods, metadata, or application-level health.
+
+Layer 7 balancing can make more application-aware decisions, depending
+on the load balancer and configuration.
+
+=== Architect’s note
+
+For gRPC-heavy systems, architects should consider:
+
+* HTTP/2 connection reuse,
+* client-side load balancing,
+* service discovery,
+* keepalive settings,
+* retries and deadlines,
+* observability,
+* and whether balancing happens at the connection level or request
+level.
+
+== 18. Experiment 7 — Health Checks and Failure Behavior
+
+Stop one backend:
+
+....
+docker compose stop app2
+....
+
+Test HTTP:
+
+....
+docker compose exec toolbox bash -lc 'for i in {1..12}; do curl -s http://nginx; done'
+....
+
+Test HAProxy:
+
+....
+docker compose exec toolbox bash -lc 'for i in {1..12}; do curl -s http://haproxy:9000; done'
+....
+
+Restart the backend:
+
+....
+docker compose start app2
+....
+
+=== Discussion
+
+Questions for participants:
+
+[arabic]
+. How quickly does the load balancer stop routing traffic to the failed
+backend?
+. Are failures visible to the client?
+. What happens to existing WebSocket connections when a backend stops?
+. What happens to gRPC clients with long-lived channels?
+
+=== Architect’s note
+
+Health checks are not just operational details. They define what the
+platform considers healthy.
+
+A shallow health check may say “OK” even when the database is
+unavailable. A deep health check may be more accurate but may also
+create additional load or false failures.
+
+== 19. Experiment 8 — Prometheus Metrics
+
+Prometheus is available at:
+
+....
+http://localhost:9090
+....
+
+Open Prometheus and try these queries.
+
+=== 19.1 HTTP request count by instance
+
+....
+sum by (instance) (app_http_requests_total)
+....
+
+=== 19.2 HTTP request rate by instance
+
+....
+sum by (instance) (rate(app_http_requests_total[1m]))
+....
+
+=== 19.3 WebSocket messages by instance
+
+....
+sum by (instance) (app_websocket_messages_total)
+....
+
+=== 19.4 gRPC requests by instance
+
+....
+sum by (instance) (app_grpc_requests_total)
+....
+
+=== 19.5 HTTP latency percentile
+
+....
+histogram_quantile(
+  0.95,
+  sum by (le, instance) (rate(app_http_request_duration_seconds_bucket[1m]))
+)
+....
+
+=== Discussion
+
+Metrics make the difference between assumed behavior and observed
+behavior.
+
+Without metrics, participants may believe the load balancer is
+distributing traffic evenly. With metrics, they can verify it.
+
+== 20. Experiment 9 — Grafana Dashboard
+
+Grafana is available at:
+
+....
+http://localhost:3000
+....
+
+Login:
+
+....
+admin / admin
+....
+
+Prometheus is already configured as a data source.
+
+Create a new dashboard with these panels.
+
+=== 20.1 Panel: HTTP requests per backend
+
+Query:
+
+....
+sum by (instance) (rate(app_http_requests_total[1m]))
+....
+
+Recommended visualization:
+
+* Time series
+* Legend: `+{{instance}}+`
+
+=== 20.2 Panel: WebSocket messages per backend
+
+Query:
+
+....
+sum by (instance) (rate(app_websocket_messages_total[1m]))
+....
+
+Recommended visualization:
+
+* Time series or bar gauge
+
+=== 20.3 Panel: gRPC requests per backend
+
+Query:
+
+....
+sum by (instance) (rate(app_grpc_requests_total[1m]))
+....
+
+Recommended visualization:
+
+* Time series
+
+=== 20.4 Panel: p95 HTTP latency
+
+Query:
+
+....
+histogram_quantile(
+  0.95,
+  sum by (le, instance) (rate(app_http_request_duration_seconds_bucket[1m]))
+)
+....
+
+Recommended visualization:
+
+* Time series
+* Unit: seconds
+
+=== 20.5 Panel: Total requests by path
+
+Query:
+
+....
+sum by (path) (app_http_requests_total)
+....
+
+Recommended visualization:
+
+* Bar gauge
+
+== 21. Experiment 10 — Compare HTTP, WebSocket, and gRPC
+
+Use the metrics dashboard while generating traffic.
+
+=== HTTP traffic
+
+....
+docker compose exec toolbox bash -lc 'for i in {1..100}; do curl -s http://nginx > /dev/null; done'
+....
+
+Expected behavior:
+
+* Many short requests
+* Distribution visible per request
+
+=== WebSocket traffic
+
+Open multiple WebSocket clients from separate terminals:
+
+....
+docker compose exec toolbox websocat ws://nginx/ws
+....
+
+Send several messages through one connection.
+
+Expected behavior:
+
+* One backend handles all messages for that connection
+* Distribution happens when new connections are established
+
+=== gRPC traffic
+
+Run repeated gRPC calls:
+
+....
+docker compose exec toolbox bash -lc '
+for i in {1..50}; do
+  grpcurl -plaintext \
+    -import-path /workspace/app \
+    -proto echo.proto \
+    -d "{\"name\":\"metrics\"}" \
+    nginx:81 echo.EchoService/SayHello > /dev/null
+done
+'
+....
+
+Expected behavior:
+
+* Distribution depends heavily on connection reuse
+* Persistent channels may reduce request-level balancing
+
+=== Architectural discussion
+
+Ask participants:
+
+[arabic]
+. Which traffic style produced the most even distribution?
+. Which style created the longest-lived backend assignment?
+. What would happen if one backend had 10,000 WebSocket clients
+connected?
+. Why can gRPC load balancing be surprising?
+. When would client-side load balancing be useful?
+
+== 22. Optional Advanced Experiment — Add Artificial Latency
+
+Modify `+/slow+` requests:
+
+....
+docker compose exec toolbox bash -lc 'for i in {1..20}; do curl -s "http://haproxy:9000/slow?delay=5" & done; wait'
+....
+
+Observe the Grafana p95 latency panel.
+
+Then compare HAProxy round robin with least connections.
+
+=== Discussion
+
+Round robin distributes request count. Least-connections reacts to
+active connection load.
+
+This is why algorithm choice must reflect request duration and workload
+shape.
+
+== 23. Optional Advanced Experiment — Scale Backends
+
+Scale the backend manually:
+
+....
+docker compose up --scale app1=1 --scale app2=1 --scale app3=1
+....
+
+For this lab, NGINX and HAProxy use static upstream names, so adding
+`+app4+` requires a configuration change.
+
+Advanced task:
+
+[arabic]
+. Add `+app4+` to `+docker-compose.yml+`.
+. Add `+app4+` to NGINX upstreams.
+. Add `+app4+` to HAProxy backends.
+. Add `+app4+` to Prometheus targets.
+. Restart and observe metrics.
+
+=== Architect’s note
+
+Static load balancer configuration is understandable for a lab, but
+dynamic environments usually need service discovery.
+
+This is one reason Kubernetes Services, Ingress controllers, and service
+meshes exist.
+
+== 24. Debrief Questions
+
+Use these questions to close the lab.
+
+[arabic]
+. When is Layer 4 load balancing preferable?
+. When is Layer 7 load balancing preferable?
+. Why does WebSocket change the meaning of “balanced traffic”?
+. Why can gRPC behave differently from simple HTTP?
+. How do metrics change architectural decision-making?
+. Which algorithm is suitable for stateless APIs?
+. Which algorithm is suitable for long-running connections?
+. What should a health check actually check?
+. Where should session state be stored in a scalable system?
+. What would change in Kubernetes?
+
+== 25. Suggested Instructor Narrative
+
+=== Opening
+
+In the lecture, load balancers were introduced as Layer 4 and Layer 7
+components. In this lab, participants will experience why that
+distinction matters.
+
+A load balancer is not just a box that spreads requests. It makes
+assumptions about protocols, connections, health, and failure.
+
+=== During HTTP tests
+
+Point out that HTTP makes distribution easy to observe because each
+request is short. This is the simplest mental model of load balancing.
+
+=== During WebSocket tests
+
+Emphasize that WebSocket changes the game. After upgrade, the connection
+stays open. The balancing decision is made at connection time, not for
+every message.
+
+=== During gRPC tests
+
+Explain that gRPC usually uses HTTP/2. HTTP/2 multiplexes many calls
+over a connection. This means the connection strategy can dominate the
+balancing behavior.
+
+=== During metrics tests
+
+Show that observability turns architecture from theory into evidence. It
+allows architects to validate assumptions about load distribution,
+latency, and failure behavior.
+
+=== Closing
+
+The main conclusion is simple:
+
+____
+Load balancing is not one pattern. It is a family of patterns shaped by
+protocol, connection lifetime, health model, and operational visibility.
+____
+
+== 26. Common Troubleshooting
+
+=== NGINX does not start
+
+Check configuration:
+
+....
+docker compose logs nginx
+....
+
+Common causes:
+
+* missing semicolon in `+nginx.conf+`,
+* wrong upstream name,
+* wrong mounted path.
+
+=== HAProxy does not start
+
+Check logs:
+
+....
+docker compose logs haproxy
+....
+
+Common causes:
+
+* invalid indentation,
+* unsupported directive,
+* backend name typo.
+
+=== Prometheus has no targets
+
+Open:
+
+....
+http://localhost:9090/targets
+....
+
+Check whether `+app1+`, `+app2+`, and `+app3+` are UP.
+
+=== Grafana has no data
+
+Check:
+
+[arabic]
+. Prometheus datasource URL is `+http://prometheus:9090+`.
+. Prometheus targets are UP.
+. Traffic has been generated after startup.
+
+=== grpcurl fails
+
+Check:
+
+[arabic]
+. NGINX exposes port `+8081+`.
+. The gRPC server inside each app listens on `+50051+`.
+. The command uses `+-plaintext+`.
+. The proto path points to /workspace/app when grpcurl runs inside the
+toolbox container.
+
+=== WebSocket client cannot connect
+
+Check:
+
+[arabic]
+. NGINX `+/ws+` location includes `+Upgrade+` and `+Connection+`
+headers.
+. The backend uses `+gevent-websocket+`.
+. The toolbox WebSocket URL is ws://nginx/ws. If a host-installed client
+is used instead, use ws://localhost:8080/ws.
+
+== 27. Extension Ideas
+
+For advanced participants:
+
+* TLS termination at NGINX
+* mTLS between load balancer and backends
+* gRPC health checking
+* WebSocket idle timeout tuning
+* HAProxy statistics page
+* NGINX access logs exported to metrics
+* Kubernetes Service and Ingress comparison
+* Traefik comparison
+* Envoy proxy comparison
+* Service mesh comparison with Istio or Linkerd
+
+== 28. Architect’s Final Takeaways
+
+[arabic]
+. HTTP load balancing is often request-oriented.
+. WebSocket load balancing is connection-oriented.
+. gRPC load balancing is strongly affected by HTTP/2 connection reuse.
+. Layer 4 load balancers are fast and protocol-agnostic, but less
+application-aware.
+. Layer 7 load balancers can make smarter routing decisions, but require
+protocol understanding.
+. Algorithms must match workload behavior.
+. Health checks define what “available” means.
+. Metrics are necessary to validate architecture assumptions.
+. Sticky routing is sometimes useful, but it creates scalability
+trade-offs.
+. The architect’s job is to connect protocol behavior to quality
+attributes: performance, availability, scalability, operability, and
+cost.
