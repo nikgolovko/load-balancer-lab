@@ -1334,7 +1334,7 @@ meshes exist.
 
 == 24. Debrief Questions
 
-Use these questions to close the lab.
+Questions for the lab:
 
 [arabic]
 . When is Layer 4 load balancing preferable?
@@ -1347,45 +1347,6 @@ Use these questions to close the lab.
 . What should a health check actually check?
 . Where should session state be stored in a scalable system?
 . What would change in Kubernetes?
-
-== 25. Suggested Instructor Narrative
-
-=== Opening
-
-In the lecture, load balancers were introduced as Layer 4 and Layer 7
-components. In this lab, participants will experience why that
-distinction matters.
-
-A load balancer is not just a box that spreads requests. It makes
-assumptions about protocols, connections, health, and failure.
-
-=== During HTTP tests
-
-Point out that HTTP makes distribution easy to observe because each
-request is short. This is the simplest mental model of load balancing.
-
-=== During WebSocket tests
-
-Emphasize that WebSocket changes the game. After upgrade, the connection
-stays open. The balancing decision is made at connection time, not for
-every message.
-
-=== During gRPC tests
-
-Explain that gRPC usually uses HTTP/2. HTTP/2 multiplexes many calls
-over a connection. This means the connection strategy can dominate the
-balancing behavior.
-
-=== During metrics tests
-
-Show that observability turns architecture from theory into evidence. It
-allows architects to validate assumptions about load distribution,
-latency, and failure behavior.
-
-=== Closing
-
-The main conclusion is simple:
-
 ____
 Load balancing is not one pattern. It is a family of patterns shaped by
 protocol, connection lifetime, health model, and operational visibility.
